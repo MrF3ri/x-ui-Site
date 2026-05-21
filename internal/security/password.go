@@ -7,7 +7,6 @@ import (
 	"errors"
 )
 
-// Mock bcrypt replacement for offline builds.
 func HashPassword(password string) (string, error) {
 	if password == "" { return "", errors.New("password required") }
 	salt := make([]byte, 16)
@@ -15,11 +14,4 @@ func HashPassword(password string) (string, error) {
 	h := sha256.Sum256(append(salt, []byte(password)...))
 	return base64.RawStdEncoding.EncodeToString(salt)+"."+base64.RawStdEncoding.EncodeToString(h[:]), nil
 }
-func ComparePassword(hash, password string) bool {
-	var saltB64, digestB64 string
-	for i,c := range hash { if c=='.' { saltB64=hash[:i]; digestB64=hash[i+1:]; break } }
-	salt, err := base64.RawStdEncoding.DecodeString(saltB64); if err != nil { return false }
-	digest, err := base64.RawStdEncoding.DecodeString(digestB64); if err != nil { return false }
-	h := sha256.Sum256(append(salt, []byte(password)...))
-	return string(h[:]) == string(digest)
-}
+func ComparePassword(hash, password string) bool { var a,b string; for i,c := range hash { if c=='.' { a=hash[:i]; b=hash[i+1:]; break } }; s,err:=base64.RawStdEncoding.DecodeString(a); if err!=nil{return false}; d,err:=base64.RawStdEncoding.DecodeString(b); if err!=nil{return false}; h:=sha256.Sum256(append(s,[]byte(password)...)); return string(h[:])==string(d) }

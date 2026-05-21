@@ -2,15 +2,22 @@ package frontend
 
 import (
 	"html/template"
+	"io/fs"
 	"net/http"
 )
 
 type Handler struct{ t *template.Template }
 
 func New() (*Handler, error) {
-	t, err := template.ParseGlob("templates/**/*.html")
-	if err != nil { return nil, err }
+	t, err := template.ParseFS(EmbeddedFiles, "assets/templates/store/*.html")
+	if err != nil {
+		return nil, err
+	}
 	return &Handler{t: t}, nil
+}
+
+func AssetsFS() (fs.FS, error) {
+	return fs.Sub(EmbeddedFiles, "assets/public/css")
 }
 
 func (h *Handler) Store(w http.ResponseWriter, r *http.Request) {

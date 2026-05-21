@@ -8,9 +8,10 @@ import (
 
 func Run() error {
 	cfg := config.Load()
-	pool, err := db.NewPostgres(cfg.DatabaseDSN)
+	dbConn, err := db.NewPostgres(cfg.DatabaseDSN)
 	if err != nil { return err }
-	defer pool.Close()
-	srv := httpserver.New(cfg.AppPort, cfg.JWTSecret)
+	defer dbConn.Close()
+	if err := db.RunMigrations(dbConn, "migrations"); err != nil { return err }
+	srv := httpserver.New(cfg.AppPort, dbConn, cfg.JWTSecret)
 	return srv.Start()
 }

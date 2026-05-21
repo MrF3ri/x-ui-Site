@@ -5,6 +5,8 @@ services:
     environment:
       APP_PORT: "8080"
       SERVER_MODE: "nethttp"
+    ports:
+      - "8080:8080"
     depends_on:
       - postgres
       - redis
