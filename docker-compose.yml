@@ -1,0 +1,66 @@
+services:
+  app:
+    build: .
+    container_name: garudapanel-app
+    environment:
+      APP_PORT: "8080"
+      SERVER_MODE: "nethttp"
+    depends_on:
+      - postgres
+      - redis
+      - minio
+    networks: [garuda]
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: garudapanel-postgres
+    environment:
+      POSTGRES_DB: garudapanel
+      POSTGRES_USER: garuda
+      POSTGRES_PASSWORD: garuda
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [garuda]
+
+  redis:
+    image: redis:7-alpine
+    container_name: garudapanel-redis
+    volumes:
+      - redis_data:/data
+    networks: [garuda]
+
+  minio:
+    image: minio/minio:RELEASE.2025-02-03T21-03-04Z
+    container_name: garudapanel-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    volumes:
+      - minio_data:/data
+    networks: [garuda]
+
+  caddy:
+    image: caddy:2.9-alpine
+    container_name: garudapanel-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+    networks: [garuda]
+
+networks:
+  garuda:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  caddy_data:
+  caddy_config:
