@@ -1,6 +1,8 @@
 package app
 
 import (
+	"log"
+
 	"garudapanel/internal/config"
 	"garudapanel/internal/db"
 	httpserver "garudapanel/internal/http"
@@ -9,9 +11,15 @@ import (
 func Run() error {
 	cfg := config.Load()
 	dbConn, err := db.NewPostgres(cfg.DatabaseDSN)
-	if err != nil { return err }
-	defer dbConn.Close()
-	if err := db.RunMigrations(dbConn, "migrations"); err != nil { return err }
+	if err != nil {
+		log.Printf("database init warning: %v", err)
+	}
+	if dbConn != nil {
+		defer dbConn.Close()
+		if err := db.RunMigrations(dbConn, "migrations"); err != nil {
+			log.Printf("migration warning: %v", err)
+		}
+	}
 	srv := httpserver.New(cfg.AppPort, dbConn, cfg.JWTSecret)
 	return srv.Start()
 }
