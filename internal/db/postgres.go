@@ -2,23 +2,12 @@ package db
 
 import (
 	"database/sql"
-	"fmt"
-	"time"
+	"errors"
 )
 
 func NewPostgres(dsn string) (*sql.DB, error) {
-	var lastErr error
-	deadline := time.Now().Add(25 * time.Second)
-	for time.Now().Before(deadline) {
-		db, err := sql.Open("postgres", dsn)
-		if err == nil {
-			if err = db.Ping(); err == nil {
-				return db, nil
-			}
-			_ = db.Close()
-		}
-		lastErr = err
-		time.Sleep(2 * time.Second)
+	if dsn == "" {
+		return nil, errors.New("empty DATABASE_DSN")
 	}
-	return nil, fmt.Errorf("postgres connection failed after retries: %w", lastErr)
+	return nil, errors.New("postgres driver not linked in this offline build; provide pgx stdlib in deployment build")
 }
