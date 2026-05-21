@@ -1,32 +1,40 @@
 package config
 
-import "os"
+import (
+	"errors"
+	"os"
+)
 
 type Config struct {
-	AppPort string
-	ServerMode string
-	DatabaseDSN string
-	JWTSecret string
-	XUIBaseURL string
-	XUIAPIToken string
+	AppPort       string
+	AppEnv        string
+	DatabaseDSN   string
+	JWTSecret     string
+	RedisAddr     string
 	MinIOEndpoint string
-	MinIOBucket string
-	MinIOAccessKey string
-	MinIOSecretKey string
 }
 
-func Load() Config {
-	return Config{
-		AppPort: env("APP_PORT", "8080"),
-		ServerMode: env("SERVER_MODE", "nethttp"),
-		DatabaseDSN: env("DATABASE_DSN", "postgres://garuda:garuda@postgres:5432/garudapanel?sslmode=disable"),
-		JWTSecret: env("JWT_SECRET", "change-me"),
-		XUIBaseURL: env("XUI_BASE_URL", "http://localhost:2053"),
-		XUIAPIToken: env("XUI_API_TOKEN", ""),
-		MinIOEndpoint: env("MINIO_ENDPOINT", "http://minio:9000"),
-		MinIOBucket: env("MINIO_BUCKET", "garuda"),
-		MinIOAccessKey: env("MINIO_ROOT_USER", "minioadmin"),
-		MinIOSecretKey: env("MINIO_ROOT_PASSWORD", "minioadmin123"),
+func Load() (Config, error) {
+	cfg := Config{
+		AppPort:       env("APP_PORT", "8080"),
+		AppEnv:        env("APP_ENV", "development"),
+		DatabaseDSN:   os.Getenv("DATABASE_DSN"),
+		JWTSecret:     os.Getenv("JWT_SECRET"),
+		RedisAddr:     env("REDIS_ADDR", "redis:6379"),
+		MinIOEndpoint: env("MINIO_ENDPOINT", "minio:9000"),
 	}
+	if cfg.DatabaseDSN == "" {
+		return Config{}, errors.New("missing required env DATABASE_DSN")
+	}
+	if cfg.JWTSecret == "" {
+		return Config{}, errors.New("missing required env JWT_SECRET")
+	}
+	return cfg, nil
 }
-func env(key, fallback string) string { if v := os.Getenv(key); v != "" { return v }; return fallback }
+
+func env(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}

@@ -5,6 +5,11 @@ services:
     environment:
       APP_PORT: "8080"
       SERVER_MODE: "nethttp"
+      APP_ENV: "development"
+      JWT_SECRET: "dev-secret"
+      DATABASE_DSN: "postgres://garuda:garuda@postgres:5432/garudapanel?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      MINIO_ENDPOINT: "minio:9000"
     ports:
       - "8080:8080"
     depends_on:
