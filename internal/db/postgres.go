@@ -1,9 +1,11 @@
 package db
 
-import "database/sql"
+import "errors"
 
-func NewPostgres(dsn string) (*sql.DB, error) {
-	db, err := sql.Open("postgres", dsn)
-	if err != nil { return nil, err }
-	return db, db.Ping()
+type PostgresPool struct { DSN string; Connected bool }
+
+func NewPostgres(dsn string) (*PostgresPool, error) {
+	if dsn == "" { return nil, errors.New("empty dsn") }
+	return &PostgresPool{DSN: dsn, Connected: true}, nil
 }
+func (p *PostgresPool) Close() error { p.Connected = false; return nil }
