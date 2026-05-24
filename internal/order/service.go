@@ -1,15 +1,171 @@
 package order
 
 import (
+	"context"
+	"database/sql"
 	"errors"
+	"fmt"
+	"log"
+
 	"garudapanel/internal/models"
 	"garudapanel/internal/notification"
-	"garudapanel/internal/payment"
+	"garudapanel/internal/repository"
 )
 
-type Repo interface { Create(o models.Order) (int64,error); UpdateStatus(orderID int64, status string) error }
-type Catalog interface { ByID(vendorID,id int64) (models.ServiceCatalogItem,error) }
-type Service struct { repo Repo; pay *payment.Service; catalog Catalog; notifier *notification.Hub }
-func New(repo Repo, pay *payment.Service, catalog Catalog, notifier *notification.Hub) *Service { return &Service{repo:repo,pay:pay,catalog:catalog,notifier:notifier} }
-func (s *Service) CreateFromWallet(vendorID,userID,catalogID int64) (int64,error){ item,err:=s.catalog.ByID(vendorID,catalogID); if err!=nil{return 0,err}; if item.VendorID!=vendorID { return 0, errors.New("vendor isolation violation") }; if err:=s.pay.Deduct(userID,item.Price); err!=nil{return 0,err}; id,err:=s.repo.Create(models.Order{VendorID:vendorID,UserID:userID,CatalogID:catalogID,Amount:item.Price,Status:"approved"}); if err==nil { s.notifier.Notify("order_status_changed", map[string]any{"order_id":id,"status":"approved"})}; return id,err }
-func (s *Service) Renew(orderID int64) error { if err:=s.repo.UpdateStatus(orderID,"renewed"); err!=nil{return err}; s.notifier.Notify("order_status_changed", map[string]any{"order_id":orderID,"status":"renewed"}); return nil }
+// LifecycleState constants.
+const (
+	StateApproved    = "approved"
+	StatePending     = "pending"
+	StateProvisioning = "provisioning"
+	StateActive      = "active"
+	StateSuspended   = "suspended"
+	StateExpired     = "expired"
+	StateFailed      = "failed"
+)
+
+// Service orchestrates order creation with idempotency and transactional wallet deduction.
+type Service struct {
+	db          *sql.DB
+	orders      *repository.OrderRepository
+	idempotency *repository.IdempotencyRepository
+	jobs        *repository.ProvisioningJobRepository
+	wallet      *repository.WalletTxRepository
+	catalog     *repository.CatalogPriceRepository
+	notifier    *notification.Hub
+}
+
+func NewService(
+	db *sql.DB,
+	orders *repository.OrderRepository,
+	idempotency *repository.IdempotencyRepository,
+	jobs *repository.ProvisioningJobRepository,
+	wallet *repository.WalletTxRepository,
+	catalog *repository.CatalogPriceRepository,
+	notifier *notification.Hub,
+) *Service {
+	return &Service{db: db, orders: orders, idempotency: idempotency, jobs: jobs, wallet: wallet, catalog: catalog, notifier: notifier}
+}
+
+// CreateRequest is the input for order creation.
+type CreateRequest struct {
+	VendorID       int64
+	UserID         int64
+	CatalogID      int64
+	IdempotencyKey string // caller-supplied, required
+}
+
+// CreateResponse is returned on success.
+type CreateResponse struct {
+	OrderID   int64  `json:"order_id"`
+	Status    string `json:"status"`
+	Lifecycle string `json:"lifecycle_state"`
+	Duplicate bool   `json:"duplicate,omitempty"` // true when idempotency key was already processed
+}
+
+// Create creates an order atomically:
+//  1. Checks for existing idempotency key (returns existing order if found).
+//  2. Validates catalog item belongs to vendor and is active.
+//  3. Opens a DB transaction.
+//  4. Locks wallet row FOR UPDATE and checks balance.
+//  5. Deducts balance + inserts ledger entry.
+//  6. Inserts order row.
+//  7. Inserts idempotency key row.
+//  8. Enqueues provisioning job.
+//  9. Commits.
+// 10. Emits notification event.
+func (s *Service) Create(ctx context.Context, req CreateRequest) (CreateResponse, error) {
+	if req.IdempotencyKey == "" {
+		return CreateResponse{}, errors.New("idempotency_key is required")
+	}
+
+	// ── Fast path: idempotency hit before touching a transaction ──────────
+	existingID, err := s.idempotency.Resolve(ctx, req.VendorID, req.UserID, req.IdempotencyKey)
+	if err != nil {
+		return CreateResponse{}, fmt.Errorf("idempotency resolve: %w", err)
+	}
+	if existingID != 0 {
+		o, err := s.orders.ByID(ctx, req.VendorID, existingID)
+		if err != nil {
+			return CreateResponse{}, fmt.Errorf("load existing order: %w", err)
+		}
+		return CreateResponse{OrderID: o.ID, Status: o.Status, Lifecycle: o.LifecycleState, Duplicate: true}, nil
+	}
+
+	// ── Validate catalog item ─────────────────────────────────────────────
+	cat, err := s.catalog.Get(ctx, req.VendorID, req.CatalogID)
+	if err != nil {
+		return CreateResponse{}, fmt.Errorf("catalog lookup: %w", err)
+	}
+	if cat.VendorID != req.VendorID {
+		return CreateResponse{}, errors.New("vendor isolation violation")
+	}
+	if !cat.IsActive {
+		return CreateResponse{}, errors.New("catalog item is not active")
+	}
+
+	// ── Transactional block ───────────────────────────────────────────────
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return CreateResponse{}, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			if rbErr := tx.Rollback(); rbErr != nil {
+				log.Printf("order: rollback error: %v", rbErr)
+			}
+		}
+	}()
+
+	// Reserve idempotency key (INSERT — will fail on duplicate key race).
+	if err = s.idempotency.ReserveTx(ctx, tx, req.VendorID, req.UserID, req.IdempotencyKey); err != nil {
+		_ = tx.Rollback()
+		return CreateResponse{}, fmt.Errorf("idempotency reserve (possible duplicate race): %w", err)
+	}
+
+	// Wallet deduction (locks wallet row FOR UPDATE internally).
+	if err = s.wallet.DeductTx(ctx, tx, req.UserID, cat.Price); err != nil {
+		_ = tx.Rollback()
+		return CreateResponse{}, fmt.Errorf("wallet deduction: %w", err)
+	}
+
+	// Create order.
+	ikey := req.IdempotencyKey
+	orderID, err := s.orders.CreateTx(ctx, tx, models.Order{
+		VendorID:       req.VendorID,
+		UserID:         req.UserID,
+		CatalogID:      req.CatalogID,
+		Amount:         cat.Price,
+		Status:         StateApproved,
+		LifecycleState: StatePending,
+		IdempotencyKey: &ikey,
+	})
+	if err != nil {
+		_ = tx.Rollback()
+		return CreateResponse{}, fmt.Errorf("order insert: %w", err)
+	}
+
+	// Link idempotency key → order.
+	if err = s.idempotency.LinkOrderTx(ctx, tx, req.VendorID, req.UserID, req.IdempotencyKey, orderID); err != nil {
+		_ = tx.Rollback()
+		return CreateResponse{}, fmt.Errorf("idempotency link: %w", err)
+	}
+
+	// Enqueue provisioning job.
+	if err = s.jobs.EnqueueTx(ctx, tx, req.VendorID, orderID); err != nil {
+		_ = tx.Rollback()
+		return CreateResponse{}, fmt.Errorf("enqueue provisioning: %w", err)
+	}
+
+	if err = tx.Commit(); err != nil {
+		return CreateResponse{}, fmt.Errorf("commit: %w", err)
+	}
+
+	// Emit notification (best-effort, non-blocking).
+	s.notifier.Notify("order.approved", map[string]any{
+		"order_id":  orderID,
+		"vendor_id": req.VendorID,
+		"user_id":   req.UserID,
+	})
+
+	return CreateResponse{OrderID: orderID, Status: StateApproved, Lifecycle: StatePending}, nil
+}
