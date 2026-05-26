@@ -1,0 +1,44 @@
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="/assets/app.css">
+  <title>Checkout - {{.Product.Title}}</title>
+</head>
+<body>
+<main>
+  <h1>Checkout — {{.Product.Title}}</h1>
+  <p>{{.Product.Description}}</p>
+  <p>Price: <strong>{{.Product.PriceToman}} toman</strong></p>
+  <p>Duration: {{.Product.DurationDays}} days</p>
+  <form id="checkout-form">
+    <input type="hidden" name="vendor_id" value="{{.Vendor.ID}}">
+    <input type="hidden" name="catalog_id" value="{{.Product.ID}}">
+    <button id="buy-btn" type="button">Purchase</button>
+  </form>
+  <p id="msg"></p>
+  <p><a href="/store/{{.Vendor.Slug}}">Back to store</a></p>
+</main>
+<script>
+document.getElementById('buy-btn').addEventListener('click', async function(){
+  const vendorID = document.querySelector('input[name=vendor_id]').value
+  const catalogID = document.querySelector('input[name=catalog_id]').value
+  const payload = { vendor_id: Number(vendorID), catalog_id: Number(catalogID), idempotency_key: Date.now().toString() }
+  const token = localStorage.getItem('auth_token') || ''
+  try {
+    const res = await fetch('/api/v1/order/create', { method: 'POST', headers: { 'Content-Type':'application/json', 'Authorization': token ? 'Bearer '+token : '' }, body: JSON.stringify(payload) })
+    const data = await res.json()
+    if (res.status === 201 || res.status === 200) {
+      window.location.href = '/store/' + '{{.Vendor.Slug}}' + '/purchase-success'
+    } else {
+      document.getElementById('msg').textContent = data.error || 'purchase failed'
+      window.location.href = '/store/' + '{{.Vendor.Slug}}' + '/purchase-failed'
+    }
+  } catch (err) {
+    document.getElementById('msg').textContent = 'network error'
+    window.location.href = '/store/' + '{{.Vendor.Slug}}' + '/purchase-failed'
+  }
+})
+</script>
+</body>
+</html>
