@@ -11,9 +11,11 @@ import (
 	"strconv"
 	"time"
 
+	"garudapanel/internal/audit"
 	"garudapanel/internal/auth"
 	"garudapanel/internal/eventbus"
 	api "garudapanel/internal/http/api"
+	"garudapanel/internal/middleware"
 	"garudapanel/internal/notification"
 	"garudapanel/internal/order"
 	"garudapanel/internal/proxy"
@@ -28,31 +30,11 @@ type Server struct{ http *stdhttp.Server }
 func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint string) *Server {
 	mux := stdhttp.NewServeMux()
 
-	// ── Static assets ─────────────────────────────────────────────────────
-	mux.Handle("/assets/", stdhttp.StripPrefix("/assets/", stdhttp.FileServer(stdhttp.Dir("public/assets"))))
-
-	// ── Storefront ────────────────────────────────────────────────────────
-	if sfh, err := storefront.NewHandler(db); err == nil {
-		mux.HandleFunc("/store", sfh.Router)
-		mux.HandleFunc("/store/", sfh.Router)
-	} else {
-		log.Printf("storefront init failed: %v", err)
-	}
-
-	// ── Health ────────────────────────────────────────────────────────────
-	mux.HandleFunc("/health", func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
-		pg := "down"
-		if db != nil && db.Ping() == nil {
-			pg = "up"
-		}
-		writeJSON(w, 200, map[string]any{
-			"status": "ok", "app": "up",
-			"postgres": pg,
-			"redis":    probeTCP(redisAddr),
-			"minio":    probeTCP(minioEndpoint),
-			"mode":     appEnv,
-		})
-	})
+	// ── Infrastructure ────────────────────────────────────────────────────
+	bus      := eventbus.New()
+	hub      := notification.NewHub(bus)
+	auditor  := audit.NewLogger(db)
+	limiter  := middleware.NewRateLimiter(120, time.Minute) // 120 req/min per IP
 
 	// ── Repositories ──────────────────────────────────────────────────────
 	ur  := repository.NewUserRepository(db)
@@ -67,146 +49,236 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 	psr := repository.NewProxyServiceRepository(db)
 	xpr := repository.NewXUIPanelRepository(db)
 
-	// ── Notification hub ─────────────────────────────────────────────────
-	bus := eventbus.New()
-	hub := notification.NewHub(bus)
+	// ── Services ──────────────────────────────────────────────────────────
+	authSvc   := auth.NewService(ur, wr, jwtSecret)
+	vendorSvc := vendor.NewService(vr)
+	walletSvc := wallet.NewService(wr)
+	orderSvc  := order.NewService(db, or_, ir, jr, wt, cp, hub)
+	proxySvc  := proxy.NewService(db, psr, xpr, jr, or_, hub)
 
-	// ── Existing auth/vendor/wallet API ──────────────────────────────────
-	r := api.New(auth.NewService(ur, wr, jwtSecret), vendor.NewService(vr), wallet.NewService(wr))
-	r.Register(mux)
+	// ── Static assets ─────────────────────────────────────────────────────
+	mux.Handle("/assets/", stdhttp.StripPrefix("/assets/",
+		stdhttp.FileServer(stdhttp.Dir("public/assets"))))
 
-	// ── Order engine ──────────────────────────────────────────────────────
-	orderSvc := order.NewService(db, or_, ir, jr, wt, cp, hub)
-	order.NewHandler(orderSvc).Register(mux)
+	// ── Storefront (public, no auth) ──────────────────────────────────────
+	if sfh, err := storefront.NewHandler(db); err == nil {
+		mux.HandleFunc("/store",  sfh.Router)
+		mux.HandleFunc("/store/", sfh.Router)
+	} else {
+		log.Printf("storefront init failed: %v", err)
+	}
 
-	// ── Proxy service engine ──────────────────────────────────────────────
-	proxySvc := proxy.NewService(db, psr, xpr, jr, or_, hub)
-	proxy.NewHandler(proxySvc).Register(mux)
-
-	// ── Catalog CRUD ──────────────────────────────────────────────────────
-	mux.HandleFunc("/api/v1/vendor/catalog/create", func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
-		if r.Header.Get("X-Role") != "vendor" {
-			httpError(w, 403, "forbidden")
-			return
+	// ── Health (public) ───────────────────────────────────────────────────
+	mux.HandleFunc("/health", func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+		pg := "down"
+		if db != nil && db.Ping() == nil {
+			pg = "up"
 		}
-		var p struct {
-			VendorID       int64  `json:"vendor_id"`
-			Slug           string
-			Title          string
-			Description    string
-			Protocol       string
-			InboundID      int64  `json:"inbound_id"`
-			XUINodeID      int64  `json:"xui_node_id"`
-			TrafficLimitGB int    `json:"traffic_limit_gb"`
-			DurationDays   int    `json:"duration_days"`
-			PriceToman     int64  `json:"price_toman"`
-			IsActive       bool   `json:"is_active"`
-			AutoProvision  bool   `json:"auto_provision"`
-			RenewalEnabled bool   `json:"renewal_enabled"`
-			CountryCode    string `json:"country_code"`
-			StockStatus    string `json:"stock_status"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-			httpError(w, 400, "bad request")
-			return
-		}
-		if err := cr.Create(repository.CatalogItemInput{
-			VendorID: p.VendorID, Slug: p.Slug, Title: p.Title,
-			Description: p.Description, Protocol: p.Protocol,
-			InboundID: p.InboundID, XUINodeID: p.XUINodeID,
-			TrafficLimitGB: p.TrafficLimitGB, DurationDays: p.DurationDays,
-			PriceToman: p.PriceToman, IsActive: p.IsActive,
-			AutoProvision: p.AutoProvision, RenewalEnabled: p.RenewalEnabled,
-			CountryCode: p.CountryCode, StockStatus: p.StockStatus,
-		}); err != nil {
-			httpError(w, 400, err.Error())
-			return
-		}
-		writeJSON(w, 201, map[string]string{"status": "created"})
+		writeJSON(w, 200, map[string]any{
+			"status": "ok", "app": "up",
+			"postgres": pg,
+			"redis":    probeTCP(redisAddr),
+			"minio":    probeTCP(minioEndpoint),
+			"mode":     appEnv,
+		})
 	})
 
-	mux.HandleFunc("/api/v1/vendor/catalog/list", func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
-		if r.Header.Get("X-Role") != "vendor" {
-			httpError(w, 403, "forbidden")
-			return
-		}
-		vid, _ := strconv.ParseInt(r.URL.Query().Get("vendor_id"), 10, 64)
-		rows, err := db.Query(
-			`SELECT id,vendor_id,slug,title,description,protocol,inbound_id,xui_node_id,
-			        traffic_limit_gb,duration_days,price_toman,is_active,auto_provision,
-			        renewal_enabled,country_code,stock_status
-			 FROM catalog_items WHERE vendor_id=$1 AND deleted_at IS NULL`, vid)
-		if err != nil {
-			httpError(w, 400, err.Error())
-			return
-		}
-		defer rows.Close()
-		out := []map[string]any{}
-		for rows.Next() {
-			var id, vendorID, inboundID, nodeID int64
-			var slug, title, description, protocol, country, stock string
-			var tgb, days int
-			var price int64
-			var active, ap, ren bool
-			_ = rows.Scan(&id, &vendorID, &slug, &title, &description, &protocol,
-				&inboundID, &nodeID, &tgb, &days, &price, &active, &ap, &ren, &country, &stock)
-			out = append(out, map[string]any{
-				"id": id, "vendor_id": vendorID, "slug": slug,
-				"title": title, "description": description, "protocol": protocol,
-				"inbound_id": inboundID, "xui_node_id": nodeID,
-				"traffic_limit_gb": tgb, "duration_days": days, "price_toman": price,
-				"is_active": active, "auto_provision": ap, "renewal_enabled": ren,
-				"country_code": country, "stock_status": stock,
+	// ── Auth routes (public, rate-limited) ────────────────────────────────
+	apiRouter := api.New(authSvc, vendorSvc, walletSvc)
+	apiRouter.Register(mux)
+
+	// ── Order routes (JWT required) ───────────────────────────────────────
+	jwtMW   := middleware.JWT(jwtSecret)
+	userMW  := middleware.RequireRole("user", "vendor", "admin")
+	vendMW  := middleware.RequireRole("vendor", "admin")
+	adminMW := middleware.RequireRole("admin")
+
+	// POST /api/v1/order/create
+	mux.HandleFunc("/api/v1/order/create", middleware.Chain(
+		func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+			if r.Method != stdhttp.MethodPost {
+				httpError(w, 405, "method not allowed"); return
+			}
+			var body struct {
+				VendorID       int64  `json:"vendor_id"`
+				CatalogID      int64  `json:"catalog_id"`
+				IdempotencyKey string `json:"idempotency_key"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				httpError(w, 400, "bad request"); return
+			}
+			userID := middleware.UserIDFromCtx(r.Context())
+			resp, err := orderSvc.Create(r.Context(), order.CreateRequest{
+				VendorID:       body.VendorID,
+				UserID:         userID,
+				CatalogID:      body.CatalogID,
+				IdempotencyKey: body.IdempotencyKey,
 			})
-		}
-		writeJSON(w, 200, out)
-	})
+			if err != nil {
+				auditor.Log(r.Context(), audit.FromRequest(r, "order.create", "order", "error"))
+				httpError(w, 400, err.Error()); return
+			}
+			auditor.Log(r.Context(), audit.FromRequest(r, "order.create", "order", "ok"))
+			code := 201
+			if resp.Duplicate { code = 200 }
+			writeJSON(w, code, resp)
+		},
+		jwtMW, userMW,
+	))
+
+	// GET /api/v1/order/get
+	mux.HandleFunc("/api/v1/order/get", middleware.Chain(
+		func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+			vendorID, _ := strconv.ParseInt(r.URL.Query().Get("vendor_id"), 10, 64)
+			orderID,  _ := strconv.ParseInt(r.URL.Query().Get("order_id"),  10, 64)
+			o, err := or_.ByID(r.Context(), vendorID, orderID)
+			if err != nil { httpError(w, 404, "not found"); return }
+			// Enforce: users can only see their own orders
+			if middleware.RoleFromCtx(r.Context()) == "user" &&
+				o.UserID != middleware.UserIDFromCtx(r.Context()) {
+				httpError(w, 403, "forbidden"); return
+			}
+			writeJSON(w, 200, o)
+		},
+		jwtMW, userMW,
+	))
+
+	// ── Proxy service routes (JWT required) ───────────────────────────────
+	proxyHandler := proxy.NewHandler(proxySvc)
+	proxyHandler.Register(mux)
+
+	// ── Vendor: catalog management ────────────────────────────────────────
+	mux.HandleFunc("/api/v1/vendor/catalog/create", middleware.Chain(
+		func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+			if r.Method != stdhttp.MethodPost { httpError(w, 405, "method not allowed"); return }
+			var p struct {
+				VendorID       int64  `json:"vendor_id"`
+				Slug           string `json:"slug"`
+				Title          string `json:"title"`
+				Description    string `json:"description"`
+				Protocol       string `json:"protocol"`
+				InboundID      int64  `json:"inbound_id"`
+				XUINodeID      int64  `json:"xui_node_id"`
+				TrafficLimitGB int    `json:"traffic_limit_gb"`
+				DurationDays   int    `json:"duration_days"`
+				PriceToman     int64  `json:"price_toman"`
+				IsActive       bool   `json:"is_active"`
+				AutoProvision  bool   `json:"auto_provision"`
+				RenewalEnabled bool   `json:"renewal_enabled"`
+				CountryCode    string `json:"country_code"`
+				StockStatus    string `json:"stock_status"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+				httpError(w, 400, "bad request"); return
+			}
+			if err := cr.Create(repository.CatalogItemInput{
+				VendorID: p.VendorID, Slug: p.Slug, Title: p.Title,
+				Description: p.Description, Protocol: p.Protocol,
+				InboundID: p.InboundID, XUINodeID: p.XUINodeID,
+				TrafficLimitGB: p.TrafficLimitGB, DurationDays: p.DurationDays,
+				PriceToman: p.PriceToman, IsActive: p.IsActive,
+				AutoProvision: p.AutoProvision, RenewalEnabled: p.RenewalEnabled,
+				CountryCode: p.CountryCode, StockStatus: p.StockStatus,
+			}); err != nil {
+				httpError(w, 400, err.Error()); return
+			}
+			auditor.Log(r.Context(), audit.FromRequest(r, "catalog.create", "catalog_item", "ok"))
+			writeJSON(w, 201, map[string]string{"status": "created"})
+		},
+		jwtMW, vendMW,
+	))
+
+	mux.HandleFunc("/api/v1/vendor/catalog/list", middleware.Chain(
+		func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+			vid, _ := strconv.ParseInt(r.URL.Query().Get("vendor_id"), 10, 64)
+			rows, err := db.QueryContext(r.Context(),
+				`SELECT id,vendor_id,slug,title,description,protocol,inbound_id,xui_node_id,
+				        traffic_limit_gb,duration_days,price_toman,is_active,auto_provision,
+				        renewal_enabled,country_code,stock_status
+				 FROM catalog_items WHERE vendor_id=$1 AND deleted_at IS NULL`, vid)
+			if err != nil { httpError(w, 400, err.Error()); return }
+			defer rows.Close()
+			out := []map[string]any{}
+			for rows.Next() {
+				var id, vendorID, inboundID, nodeID int64
+				var slug, title, description, protocol, country, stock string
+				var tgb, days int
+				var price int64
+				var active, ap, ren bool
+				_ = rows.Scan(&id, &vendorID, &slug, &title, &description, &protocol,
+					&inboundID, &nodeID, &tgb, &days, &price, &active, &ap, &ren, &country, &stock)
+				out = append(out, map[string]any{
+					"id": id, "vendor_id": vendorID, "slug": slug,
+					"title": title, "description": description, "protocol": protocol,
+					"inbound_id": inboundID, "xui_node_id": nodeID,
+					"traffic_limit_gb": tgb, "duration_days": days, "price_toman": price,
+					"is_active": active, "auto_provision": ap, "renewal_enabled": ren,
+					"country_code": country, "stock_status": stock,
+				})
+			}
+			writeJSON(w, 200, out)
+		},
+		jwtMW, vendMW,
+	))
 
 	// ── Panel management ──────────────────────────────────────────────────
-	mux.HandleFunc("/api/v1/vendor/panel/add", func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
-		if r.Header.Get("X-Role") != "vendor" {
-			httpError(w, 403, "forbidden")
-			return
-		}
-		var body struct {
-			VendorID  int64  `json:"vendor_id"`
-			Name      string `json:"name"`
-			URL       string `json:"url"`
-			Token     string `json:"token"`
-			InboundID int64  `json:"inbound_id"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			httpError(w, 400, "bad request")
-			return
-		}
-		id, err := xpr.Create(context.Background(), repository.XUIPanelRecord{
-			VendorID:  body.VendorID,
-			Name:      body.Name,
-			URL:       body.URL,
-			Token:     body.Token,
-			InboundID: body.InboundID,
-			IsActive:  true,
-		})
-		if err != nil {
-			httpError(w, 400, err.Error())
-			return
-		}
-		writeJSON(w, 201, map[string]any{"panel_id": id, "status": "created"})
-	})
+	mux.HandleFunc("/api/v1/vendor/panel/add", middleware.Chain(
+		func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+			if r.Method != stdhttp.MethodPost { httpError(w, 405, "method not allowed"); return }
+			var body struct {
+				VendorID  int64  `json:"vendor_id"`
+				Name      string `json:"name"`
+				URL       string `json:"url"`
+				Token     string `json:"token"`
+				InboundID int64  `json:"inbound_id"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				httpError(w, 400, "bad request"); return
+			}
+			id, err := xpr.Create(r.Context(), repository.XUIPanelRecord{
+				VendorID:  body.VendorID,
+				Name:      body.Name,
+				URL:       body.URL,
+				Token:     body.Token,
+				InboundID: body.InboundID,
+				IsActive:  true,
+			})
+			if err != nil { httpError(w, 400, err.Error()); return }
+			auditor.Log(r.Context(), audit.FromRequest(r, "panel.add", "xui_panel", "ok"))
+			writeJSON(w, 201, map[string]any{"panel_id": id, "status": "created"})
+		},
+		jwtMW, vendMW,
+	))
 
-	mux.HandleFunc("/api/v1/vendor/panel/list", func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
-		if r.Header.Get("X-Role") != "vendor" {
-			httpError(w, 403, "forbidden")
-			return
-		}
-		vid, _ := strconv.ParseInt(r.URL.Query().Get("vendor_id"), 10, 64)
-		panels, err := xpr.ListByVendor(context.Background(), vid)
-		if err != nil {
-			httpError(w, 400, err.Error())
-			return
-		}
-		writeJSON(w, 200, panels)
-	})
+	mux.HandleFunc("/api/v1/vendor/panel/list", middleware.Chain(
+		func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+			vid, _ := strconv.ParseInt(r.URL.Query().Get("vendor_id"), 10, 64)
+			panels, err := xpr.ListByVendor(r.Context(), vid)
+			if err != nil { httpError(w, 400, err.Error()); return }
+			writeJSON(w, 200, panels)
+		},
+		jwtMW, vendMW,
+	))
+
+	// ── Wallet top-up (admin only) ────────────────────────────────────────
+	mux.HandleFunc("/api/v1/admin/wallet/topup", middleware.Chain(
+		func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+			if r.Method != stdhttp.MethodPost { httpError(w, 405, "method not allowed"); return }
+			var body struct {
+				UserID int64 `json:"user_id"`
+				Amount int64 `json:"amount"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				httpError(w, 400, "bad request"); return
+			}
+			if err := wr.ApplyTransaction(body.UserID, body.Amount, "admin_topup"); err != nil {
+				httpError(w, 400, err.Error()); return
+			}
+			auditor.Log(r.Context(), audit.FromRequest(r, "wallet.topup", "wallet", "ok"))
+			writeJSON(w, 200, map[string]string{"status": "ok"})
+		},
+		jwtMW, adminMW,
+	))
 
 	// ── SSE notification stream ───────────────────────────────────────────
 	mux.HandleFunc("/api/v1/events", hub.WS)
@@ -220,9 +292,19 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 		}
 	}()
 
+	// ── Wrap with security headers + rate limiter + recovery ──────────────
+	handler := middleware.SecureHeaders(
+		limiter.Middleware(
+			recovery(mux),
+		),
+	)
+
 	return &Server{http: &stdhttp.Server{
-		Addr:    fmt.Sprintf(":%s", addr),
-		Handler: recovery(mux),
+		Addr:         fmt.Sprintf(":%s", addr),
+		Handler:      handler,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}}
 }
 
@@ -239,13 +321,9 @@ func httpError(w stdhttp.ResponseWriter, code int, msg string) {
 }
 
 func probeTCP(addr string) string {
-	if addr == "" {
-		return "down"
-	}
+	if addr == "" { return "down" }
 	c, err := net.DialTimeout("tcp", addr, 800*time.Millisecond)
-	if err != nil {
-		return "down"
-	}
+	if err != nil { return "down" }
 	_ = c.Close()
 	return "up"
 }
