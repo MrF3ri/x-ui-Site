@@ -5,19 +5,24 @@ import (
 	"html/template"
 	"net/http"
 	"strings"
+
+	"garudapanel/internal/middleware"
+	"garudapanel/internal/wallet"
 )
 
 type Handler struct {
-	svc *Service
-	t   *template.Template
+	svc       *Service
+	t         *template.Template
+	jwtSecret string
+	walletSvc *wallet.Service
 }
 
-func NewHandler(db *sql.DB) (*Handler, error) {
+func NewHandler(db *sql.DB, jwtSecret string, walletSvc *wallet.Service) (*Handler, error) {
 	t, err := template.ParseGlob("templates/store/*.html")
 	if err != nil {
 		return nil, err
 	}
-	return &Handler{svc: New(db), t: t}, nil
+	return &Handler{svc: New(db), t: t, jwtSecret: jwtSecret, walletSvc: walletSvc}, nil
 }
 
 func (h *Handler) render(w http.ResponseWriter, name string, data any, code int) {
@@ -70,7 +75,20 @@ func (h *Handler) Router(w http.ResponseWriter, r *http.Request) {
 			h.render(w, "not_found.html", map[string]any{"Message": "product not found"}, 404)
 			return
 		}
-		h.render(w, "checkout.html", map[string]any{"Vendor": vendor, "Product": prod}, 200)
+		// Attempt to extract JWT for SSR wallet balance. If missing, render login prompt.
+		token := middleware.ExtractToken(r)
+		if token == "" {
+			h.render(w, "checkout_login.html", map[string]any{"Vendor": vendor, "Product": prod}, 200)
+			return
+		}
+		claims, ok := middleware.ParseToken(h.jwtSecret, token)
+		if !ok {
+			h.render(w, "checkout_login.html", map[string]any{"Vendor": vendor, "Product": prod}, 200)
+			return
+		}
+		bal, _ := h.walletSvc.Balance(claims.Sub)
+		canAfford := bal >= prod.PriceToman
+		h.render(w, "checkout.html", map[string]any{"Vendor": vendor, "Product": prod, "WalletBalance": bal, "CanAfford": canAfford}, 200)
 		return
 	}
 

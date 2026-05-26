@@ -60,8 +60,8 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 	mux.Handle("/assets/", stdhttp.StripPrefix("/assets/",
 		stdhttp.FileServer(stdhttp.Dir("public/assets"))))
 
-	// ── Storefront (public, no auth) ──────────────────────────────────────
-	if sfh, err := storefront.NewHandler(db); err == nil {
+	// ── Storefront (public, SSR wallet-aware) ─────────────────────────────
+	if sfh, err := storefront.NewHandler(db, jwtSecret, walletSvc); err == nil {
 		mux.HandleFunc("/store",  sfh.Router)
 		mux.HandleFunc("/store/", sfh.Router)
 	} else {

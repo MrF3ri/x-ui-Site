@@ -145,3 +145,9 @@ func jsonError(w http.ResponseWriter, code int, msg string) {
 	w.WriteHeader(code)
 	_, _ = w.Write([]byte(`{"error":"` + msg + `"}`))
 }
+
+// ParseToken exposes JWT parsing for non-middleware usage.
+func ParseToken(secret, token string) (Claims, bool) { return parseJWT(secret, token) }
+
+// ExtractToken extracts a bearer token from the request without returning errors.
+func ExtractToken(r *http.Request) string { return extractBearer(r) }
