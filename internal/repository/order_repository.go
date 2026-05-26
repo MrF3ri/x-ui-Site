@@ -58,6 +58,28 @@ func (r *OrderRepository) ByID(ctx context.Context, vendorID, orderID int64) (mo
 	return o, err
 }
 
+// ListByUser returns recent orders for a given user.
+func (r *OrderRepository) ListByUser(ctx context.Context, userID int64, limit int) ([]models.Order, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT id, vendor_id, user_id, catalog_id, amount, status, lifecycle_state, created_at
+		 FROM orders WHERE user_id=$1 AND deleted_at IS NULL ORDER BY id DESC LIMIT $2`,
+		userID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []models.Order{}
+	for rows.Next() {
+		var o models.Order
+		if err := rows.Scan(&o.ID, &o.VendorID, &o.UserID, &o.CatalogID, &o.Amount, &o.Status, &o.LifecycleState, &o.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
 // IdempotencyRepo handles order_idempotency_keys.
 type IdempotencyRepository struct{ db *sql.DB }
 

@@ -73,6 +73,99 @@ func (r *ProxyServiceRepository) ByID(ctx context.Context, vendorID, id int64) (
 	return rec, err
 }
 
+// ByIDForUserTx returns a proxy service by id and user_id within a transaction (FOR UPDATE).
+func (r *ProxyServiceRepository) ByIDForUserTx(ctx context.Context, tx *sql.Tx, id, userID int64) (ProxyServiceRecord, error) {
+	var rec ProxyServiceRecord
+	err := tx.QueryRowContext(ctx,
+		`SELECT id, vendor_id, user_id, order_id, panel_id,
+				uuid, protocol, subscription_url, qr_payload,
+				config_payload, status, expires_at,
+				traffic_used_gb, traffic_limit_gb, duration_days,
+				created_at, updated_at
+		 FROM proxy_services
+		 WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL FOR UPDATE`,
+		id, userID,
+	).Scan(
+		&rec.ID, &rec.VendorID, &rec.UserID, &rec.OrderID, &rec.PanelID,
+		&rec.UUID, &rec.Protocol, &rec.SubscriptionURL, &rec.QRPayload,
+		&rec.ConfigPayload, &rec.Status, &rec.ExpiresAt,
+		&rec.TrafficUsedGB, &rec.TrafficLimitGB, &rec.DurationDays,
+		&rec.CreatedAt, &rec.UpdatedAt,
+	)
+	return rec, err
+}
+
+// ListAllByUser returns all proxy services for a given user across vendors.
+func (r *ProxyServiceRepository) ListAllByUser(ctx context.Context, userID int64) ([]ProxyServiceRecord, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT id, vendor_id, user_id, order_id, panel_id,
+				uuid, protocol, subscription_url, qr_payload,
+				config_payload, status, expires_at,
+				traffic_used_gb, traffic_limit_gb, duration_days,
+				created_at, updated_at
+		 FROM proxy_services
+		 WHERE user_id=$1 AND deleted_at IS NULL
+		 ORDER BY id DESC`,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ProxyServiceRecord
+	for rows.Next() {
+		var rec ProxyServiceRecord
+		if err := rows.Scan(
+			&rec.ID, &rec.VendorID, &rec.UserID, &rec.OrderID, &rec.PanelID,
+			&rec.UUID, &rec.Protocol, &rec.SubscriptionURL, &rec.QRPayload,
+			&rec.ConfigPayload, &rec.Status, &rec.ExpiresAt,
+			&rec.TrafficUsedGB, &rec.TrafficLimitGB, &rec.DurationDays,
+			&rec.CreatedAt, &rec.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// ByIDForUser returns a proxy service by id and user_id (non-transactional).
+func (r *ProxyServiceRepository) ByIDForUser(ctx context.Context, id, userID int64) (ProxyServiceRecord, error) {
+	var rec ProxyServiceRecord
+	err := r.db.QueryRowContext(ctx,
+		`SELECT id, vendor_id, user_id, order_id, panel_id,
+				uuid, protocol, subscription_url, qr_payload,
+				config_payload, status, expires_at,
+				traffic_used_gb, traffic_limit_gb, duration_days,
+				created_at, updated_at
+		 FROM proxy_services
+		 WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL`,
+		id, userID,
+	).Scan(
+		&rec.ID, &rec.VendorID, &rec.UserID, &rec.OrderID, &rec.PanelID,
+		&rec.UUID, &rec.Protocol, &rec.SubscriptionURL, &rec.QRPayload,
+		&rec.ConfigPayload, &rec.Status, &rec.ExpiresAt,
+		&rec.TrafficUsedGB, &rec.TrafficLimitGB, &rec.DurationDays,
+		&rec.CreatedAt, &rec.UpdatedAt,
+	)
+	return rec, err
+}
+
+// ExtendExpiryTx extends the expiry of a proxy service by given days inside a transaction.
+func (r *ProxyServiceRepository) ExtendExpiryTx(ctx context.Context, tx *sql.Tx, id int64, days int) error {
+	// If expires_at is null or in the past, set to now() + days; else add days to existing expiry.
+	_, err := tx.ExecContext(ctx,
+		`UPDATE proxy_services
+		 SET expires_at = CASE WHEN expires_at IS NULL OR expires_at < now()
+			 THEN now() + ($1 || ' days')::interval
+			 ELSE expires_at + ($1 || ' days')::interval END,
+			 updated_at = now()
+		 WHERE id=$2`,
+		days, id,
+	)
+	return err
+}
+
 // ByUUID returns a proxy service by UUID (vendor-isolated).
 func (r *ProxyServiceRepository) ByUUID(ctx context.Context, vendorID int64, uuid string) (ProxyServiceRecord, error) {
 	var rec ProxyServiceRecord

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"garudapanel/internal/models"
 	"garudapanel/internal/notification"
@@ -32,6 +33,7 @@ type Service struct {
 	wallet      *repository.WalletTxRepository
 	catalog     *repository.CatalogPriceRepository
 	notifier    *notification.Hub
+	proxy       *repository.ProxyServiceRepository
 }
 
 func NewService(
@@ -42,8 +44,104 @@ func NewService(
 	wallet *repository.WalletTxRepository,
 	catalog *repository.CatalogPriceRepository,
 	notifier *notification.Hub,
+	proxy *repository.ProxyServiceRepository,
 ) *Service {
-	return &Service{db: db, orders: orders, idempotency: idempotency, jobs: jobs, wallet: wallet, catalog: catalog, notifier: notifier}
+	return &Service{db: db, orders: orders, idempotency: idempotency, jobs: jobs, wallet: wallet, catalog: catalog, notifier: notifier, proxy: proxy}
+}
+
+// Renew handles renewal of an existing proxy service owned by userID.
+// It performs wallet deduction, creates an order, enqueues provisioning, and extends expiry within a single transaction.
+func (s *Service) Renew(ctx context.Context, userID, serviceID int64) (CreateResponse, error) {
+	// Begin transaction
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return CreateResponse{}, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// Lock service row for update and ensure ownership
+	svcRec, err := s.proxy.ByIDForUserTx(ctx, tx, serviceID, userID)
+	if err != nil {
+		_ = tx.Rollback()
+		return CreateResponse{}, err
+	}
+	if svcRec.OrderID == nil {
+		_ = tx.Rollback()
+		return CreateResponse{}, errors.New("original order not found for service")
+	}
+
+	// Load original order to find catalog id/price
+	origOrder, err := s.orders.ByID(ctx, svcRec.VendorID, *svcRec.OrderID)
+	if err != nil {
+		_ = tx.Rollback()
+		return CreateResponse{}, err
+	}
+
+	// Get catalog price
+	cat, err := s.catalog.Get(ctx, svcRec.VendorID, origOrder.CatalogID)
+	if err != nil {
+		_ = tx.Rollback()
+		return CreateResponse{}, err
+	}
+
+	// Reserve idempotency key
+	key := fmt.Sprintf("renew:%d:%d", serviceID, time.Now().UnixNano())
+	if err = s.idempotency.ReserveTx(ctx, tx, svcRec.VendorID, userID, key); err != nil {
+		_ = tx.Rollback()
+		return CreateResponse{}, err
+	}
+
+	// Deduct wallet
+	if err = s.wallet.DeductTx(ctx, tx, userID, cat.Price); err != nil {
+		_ = tx.Rollback()
+		return CreateResponse{}, err
+	}
+
+	// Create order record
+	ikey := key
+	orderID, err := s.orders.CreateTx(ctx, tx, models.Order{
+		VendorID:       svcRec.VendorID,
+		UserID:         userID,
+		CatalogID:      origOrder.CatalogID,
+		Amount:         cat.Price,
+		Status:         StateApproved,
+		LifecycleState: StatePending,
+		IdempotencyKey: &ikey,
+	})
+	if err != nil {
+		_ = tx.Rollback()
+		return CreateResponse{}, err
+	}
+
+	// Link idempotency to new order
+	if err = s.idempotency.LinkOrderTx(ctx, tx, svcRec.VendorID, userID, key, orderID); err != nil {
+		_ = tx.Rollback()
+		return CreateResponse{}, err
+	}
+
+	// Enqueue provisioning job
+	if err = s.jobs.EnqueueTx(ctx, tx, svcRec.VendorID, orderID); err != nil {
+		_ = tx.Rollback()
+		return CreateResponse{}, err
+	}
+
+	// Extend proxy service expiry
+	if err = s.proxy.ExtendExpiryTx(ctx, tx, serviceID, svcRec.DurationDays); err != nil {
+		_ = tx.Rollback()
+		return CreateResponse{}, err
+	}
+
+	if err = tx.Commit(); err != nil {
+		return CreateResponse{}, err
+	}
+
+	// Notify
+	s.notifier.Notify("order.renewed", map[string]any{"order_id": orderID, "service_id": serviceID, "user_id": userID})
+	return CreateResponse{OrderID: orderID, Status: StateApproved, Lifecycle: StatePending}, nil
 }
 
 // CreateRequest is the input for order creation.

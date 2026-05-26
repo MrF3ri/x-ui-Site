@@ -15,3 +15,27 @@ func (r *WalletRepository) ApplyTransaction(userID int64, amount int64, typ stri
 	if _, err = tx.Exec(`INSERT INTO wallet_transactions(wallet_id,user_id,amount,type) VALUES($1,$2,$3,$4)`, walletID,userID,amount,typ); err != nil { return err }
 	return tx.Commit()
 }
+
+// ListTransactions returns recent wallet transactions for a user.
+func (r *WalletRepository) ListTransactions(userID int64, limit int) ([]map[string]any, error) {
+	rows, err := r.db.Query(
+		`SELECT id, wallet_id, user_id, amount, type, created_at FROM wallet_transactions WHERE user_id=$1 AND deleted_at IS NULL ORDER BY id DESC LIMIT $2`,
+		userID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var id, walletID, uid int64
+		var amount int64
+		var typ string
+		var createdAt string
+		if err := rows.Scan(&id, &walletID, &uid, &amount, &typ, &createdAt); err != nil {
+			return nil, err
+		}
+		out = append(out, map[string]any{"id": id, "wallet_id": walletID, "user_id": uid, "amount": amount, "type": typ, "created_at": createdAt})
+	}
+	return out, rows.Err()
+}

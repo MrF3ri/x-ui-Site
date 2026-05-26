@@ -9,6 +9,7 @@ import (
 	stdhttp "net/http"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"garudapanel/internal/audit"
@@ -21,6 +22,7 @@ import (
 	"garudapanel/internal/proxy"
 	"garudapanel/internal/repository"
 	"garudapanel/internal/storefront"
+	"garudapanel/internal/dashboard"
 	"garudapanel/internal/vendor"
 	"garudapanel/internal/wallet"
 )
@@ -53,7 +55,7 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 	authSvc   := auth.NewService(ur, wr, jwtSecret)
 	vendorSvc := vendor.NewService(vr)
 	walletSvc := wallet.NewService(wr)
-	orderSvc  := order.NewService(db, or_, ir, jr, wt, cp, hub)
+	orderSvc  := order.NewService(db, or_, ir, jr, wt, cp, hub, psr)
 	proxySvc  := proxy.NewService(db, psr, xpr, jr, or_, hub)
 
 	// ── Static assets ─────────────────────────────────────────────────────
@@ -126,6 +128,22 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 		jwtMW, userMW,
 	))
 
+	// POST /api/v1/order/renew/:serviceID
+	mux.HandleFunc("/api/v1/order/renew/", middleware.Chain(
+		func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+			if r.Method != stdhttp.MethodPost { httpError(w, 405, "method not allowed"); return }
+			sidStr := strings.TrimPrefix(r.URL.Path, "/api/v1/order/renew/")
+			sid, _ := strconv.ParseInt(sidStr, 10, 64)
+			if sid == 0 { httpError(w, 400, "invalid service id"); return }
+			userID := middleware.UserIDFromCtx(r.Context())
+			resp, err := orderSvc.Renew(r.Context(), userID, sid)
+			if err != nil { auditor.Log(r.Context(), audit.FromRequest(r, "order.renew", "order", "error")); httpError(w, 400, err.Error()); return }
+			auditor.Log(r.Context(), audit.FromRequest(r, "order.renew", "order", "ok"))
+			writeJSON(w, 201, resp)
+		},
+		jwtMW, userMW,
+	))
+
 	// GET /api/v1/order/get
 	mux.HandleFunc("/api/v1/order/get", middleware.Chain(
 		func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
@@ -146,6 +164,12 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 	// ── Proxy service routes (JWT required) ───────────────────────────────
 	proxyHandler := proxy.NewHandler(proxySvc)
 	proxyHandler.Register(mux)
+
+	// ── User dashboard (JWT required) ───────────────────────────────────
+    if dh := dashboard.NewHandler(db, or_, psr, wr, walletSvc); dh != nil {
+        mux.HandleFunc("/dashboard", middleware.Chain(dh.Router, jwtMW, userMW))
+        mux.HandleFunc("/dashboard/", middleware.Chain(dh.Router, jwtMW, userMW))
+    }
 
 	// ── Vendor: catalog management ────────────────────────────────────────
 	mux.HandleFunc("/api/v1/vendor/catalog/create", middleware.Chain(
