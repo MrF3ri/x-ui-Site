@@ -1,6 +1,7 @@
 package http
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -8,12 +9,14 @@ import (
 	stdhttp "net/http"
 	"net"
 	"strconv"
+	"time"
 
 	"garudapanel/internal/auth"
 	"garudapanel/internal/eventbus"
 	api "garudapanel/internal/http/api"
 	"garudapanel/internal/notification"
 	"garudapanel/internal/order"
+	"garudapanel/internal/proxy"
 	"garudapanel/internal/repository"
 	"garudapanel/internal/storefront"
 	"garudapanel/internal/vendor"
@@ -42,31 +45,33 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 		if db != nil && db.Ping() == nil {
 			pg = "up"
 		}
-		redis := probeTCP(redisAddr)
-		minio := probeTCP(minioEndpoint)
 		writeJSON(w, 200, map[string]any{
 			"status": "ok", "app": "up",
-			"postgres": pg, "redis": redis, "minio": minio,
-			"mode": appEnv, "environment": appEnv,
+			"postgres": pg,
+			"redis":    probeTCP(redisAddr),
+			"minio":    probeTCP(minioEndpoint),
+			"mode":     appEnv,
 		})
 	})
 
 	// ── Repositories ──────────────────────────────────────────────────────
-	ur := repository.NewUserRepository(db)
-	wr := repository.NewWalletRepository(db)
-	vr := repository.NewVendorRepository(db)
-	cr := repository.NewCatalogRepository(db)
+	ur  := repository.NewUserRepository(db)
+	wr  := repository.NewWalletRepository(db)
+	vr  := repository.NewVendorRepository(db)
+	cr  := repository.NewCatalogRepository(db)
 	or_ := repository.NewOrderRepository(db)
-	ir := repository.NewIdempotencyRepository(db)
-	jr := repository.NewProvisioningJobRepository(db)
-	wt := repository.NewWalletTxRepository(db)
-	cp := repository.NewCatalogPriceRepository(db)
+	ir  := repository.NewIdempotencyRepository(db)
+	jr  := repository.NewProvisioningJobRepository(db)
+	wt  := repository.NewWalletTxRepository(db)
+	cp  := repository.NewCatalogPriceRepository(db)
+	psr := repository.NewProxyServiceRepository(db)
+	xpr := repository.NewXUIPanelRepository(db)
 
 	// ── Notification hub ─────────────────────────────────────────────────
 	bus := eventbus.New()
 	hub := notification.NewHub(bus)
 
-	// ── Existing API router ───────────────────────────────────────────────
+	// ── Existing auth/vendor/wallet API ──────────────────────────────────
 	r := api.New(auth.NewService(ur, wr, jwtSecret), vendor.NewService(vr), wallet.NewService(wr))
 	r.Register(mux)
 
@@ -74,7 +79,11 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 	orderSvc := order.NewService(db, or_, ir, jr, wt, cp, hub)
 	order.NewHandler(orderSvc).Register(mux)
 
-	// ── Catalog CRUD (vendor-scoped) ──────────────────────────────────────
+	// ── Proxy service engine ──────────────────────────────────────────────
+	proxySvc := proxy.NewService(db, psr, xpr, jr, or_, hub)
+	proxy.NewHandler(proxySvc).Register(mux)
+
+	// ── Catalog CRUD ──────────────────────────────────────────────────────
 	mux.HandleFunc("/api/v1/vendor/catalog/create", func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		if r.Header.Get("X-Role") != "vendor" {
 			httpError(w, 403, "forbidden")
@@ -86,14 +95,14 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 			Title          string
 			Description    string
 			Protocol       string
-			InboundID      int64 `json:"inbound_id"`
-			XUINodeID      int64 `json:"xui_node_id"`
-			TrafficLimitGB int   `json:"traffic_limit_gb"`
-			DurationDays   int   `json:"duration_days"`
-			PriceToman     int64 `json:"price_toman"`
-			IsActive       bool  `json:"is_active"`
-			AutoProvision  bool  `json:"auto_provision"`
-			RenewalEnabled bool  `json:"renewal_enabled"`
+			InboundID      int64  `json:"inbound_id"`
+			XUINodeID      int64  `json:"xui_node_id"`
+			TrafficLimitGB int    `json:"traffic_limit_gb"`
+			DurationDays   int    `json:"duration_days"`
+			PriceToman     int64  `json:"price_toman"`
+			IsActive       bool   `json:"is_active"`
+			AutoProvision  bool   `json:"auto_provision"`
+			RenewalEnabled bool   `json:"renewal_enabled"`
 			CountryCode    string `json:"country_code"`
 			StockStatus    string `json:"stock_status"`
 		}
@@ -142,8 +151,8 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 			_ = rows.Scan(&id, &vendorID, &slug, &title, &description, &protocol,
 				&inboundID, &nodeID, &tgb, &days, &price, &active, &ap, &ren, &country, &stock)
 			out = append(out, map[string]any{
-				"id": id, "vendor_id": vendorID, "slug": slug, "title": title,
-				"description": description, "protocol": protocol,
+				"id": id, "vendor_id": vendorID, "slug": slug,
+				"title": title, "description": description, "protocol": protocol,
 				"inbound_id": inboundID, "xui_node_id": nodeID,
 				"traffic_limit_gb": tgb, "duration_days": days, "price_toman": price,
 				"is_active": active, "auto_provision": ap, "renewal_enabled": ren,
@@ -153,11 +162,68 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 		writeJSON(w, 200, out)
 	})
 
+	// ── Panel management ──────────────────────────────────────────────────
+	mux.HandleFunc("/api/v1/vendor/panel/add", func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+		if r.Header.Get("X-Role") != "vendor" {
+			httpError(w, 403, "forbidden")
+			return
+		}
+		var body struct {
+			VendorID  int64  `json:"vendor_id"`
+			Name      string `json:"name"`
+			URL       string `json:"url"`
+			Token     string `json:"token"`
+			InboundID int64  `json:"inbound_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			httpError(w, 400, "bad request")
+			return
+		}
+		id, err := xpr.Create(context.Background(), repository.XUIPanelRecord{
+			VendorID:  body.VendorID,
+			Name:      body.Name,
+			URL:       body.URL,
+			Token:     body.Token,
+			InboundID: body.InboundID,
+			IsActive:  true,
+		})
+		if err != nil {
+			httpError(w, 400, err.Error())
+			return
+		}
+		writeJSON(w, 201, map[string]any{"panel_id": id, "status": "created"})
+	})
+
+	mux.HandleFunc("/api/v1/vendor/panel/list", func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+		if r.Header.Get("X-Role") != "vendor" {
+			httpError(w, 403, "forbidden")
+			return
+		}
+		vid, _ := strconv.ParseInt(r.URL.Query().Get("vendor_id"), 10, 64)
+		panels, err := xpr.ListByVendor(context.Background(), vid)
+		if err != nil {
+			httpError(w, 400, err.Error())
+			return
+		}
+		writeJSON(w, 200, panels)
+	})
+
 	// ── SSE notification stream ───────────────────────────────────────────
 	mux.HandleFunc("/api/v1/events", hub.WS)
 
-	h := recovery(mux)
-	return &Server{http: &stdhttp.Server{Addr: fmt.Sprintf(":%s", addr), Handler: h}}
+	// ── Background jobs ───────────────────────────────────────────────────
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			proxySvc.RunExpiryJob(context.Background())
+		}
+	}()
+
+	return &Server{http: &stdhttp.Server{
+		Addr:    fmt.Sprintf(":%s", addr),
+		Handler: recovery(mux),
+	}}
 }
 
 func (s *Server) Start() error { return s.http.ListenAndServe() }
@@ -176,7 +242,7 @@ func probeTCP(addr string) string {
 	if addr == "" {
 		return "down"
 	}
-	c, err := net.DialTimeout("tcp", addr, 800*1000*1000)
+	c, err := net.DialTimeout("tcp", addr, 800*time.Millisecond)
 	if err != nil {
 		return "down"
 	}
