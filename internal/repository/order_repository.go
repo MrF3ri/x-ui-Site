@@ -38,6 +38,12 @@ func (r *OrderRepository) CreateTx(ctx context.Context, tx *sql.Tx, o models.Ord
 	return id, err
 }
 
+// LinkServiceTx sets the service_id for an order inside a transaction.
+func (r *OrderRepository) LinkServiceTx(ctx context.Context, tx *sql.Tx, orderID, serviceID int64) error {
+	_, err := tx.ExecContext(ctx, `UPDATE orders SET service_id=$1, updated_at=now() WHERE id=$2`, serviceID, orderID)
+	return err
+}
+
 // UpdateStatus transitions order status and lifecycle_state.
 func (r *OrderRepository) UpdateStatus(ctx context.Context, orderID int64, status, lifecycle string) error {
 	_, err := r.db.ExecContext(ctx,
@@ -143,18 +149,21 @@ func (r *ProvisioningJobRepository) EnqueueTx(ctx context.Context, tx *sql.Tx, v
 	return err
 }
 
-func (r *ProvisioningJobRepository) ClaimNext(ctx context.Context) (jobID, orderID int64, err error) {
-	err = r.db.QueryRowContext(ctx,
-		`UPDATE provisioning_jobs SET status='provisioning', updated_at=now()
-		 WHERE id = (
-		   SELECT id FROM provisioning_jobs
-		   WHERE status='pending' AND dead_letter=FALSE AND deleted_at IS NULL
-		   ORDER BY id
-		   FOR UPDATE SKIP LOCKED
-		   LIMIT 1
-		 ) RETURNING id, order_id`,
-	).Scan(&jobID, &orderID)
-	return
+func (r *ProvisioningJobRepository) ClaimNext(ctx context.Context) (jobID, orderID, vendorID int64, err error) {
+		err = r.db.QueryRowContext(ctx,
+				`UPDATE provisioning_jobs SET status='provisioning', updated_at=now()
+				 WHERE id = (
+					 SELECT id FROM provisioning_jobs
+					 WHERE status='pending' AND dead_letter=FALSE AND deleted_at IS NULL
+					 ORDER BY id
+					 FOR UPDATE SKIP LOCKED
+					 LIMIT 1
+				 ) RETURNING id, order_id, vendor_id`,
+		).Scan(&jobID, &orderID, &vendorID)
+		if err != nil {
+				return 0, 0, 0, err
+		}
+		return jobID, orderID, vendorID, nil
 }
 
 func (r *ProvisioningJobRepository) MarkDone(ctx context.Context, jobID int64) error {

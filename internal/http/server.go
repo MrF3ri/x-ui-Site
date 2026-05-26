@@ -21,6 +21,8 @@ import (
 	"garudapanel/internal/order"
 	"garudapanel/internal/proxy"
 	"garudapanel/internal/repository"
+	"garudapanel/internal/provisioning"
+	"garudapanel/internal/xui"
 	"garudapanel/internal/storefront"
 	"garudapanel/internal/dashboard"
 	"garudapanel/internal/vendor"
@@ -49,7 +51,7 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 	wt  := repository.NewWalletTxRepository(db)
 	cp  := repository.NewCatalogPriceRepository(db)
 	psr := repository.NewProxyServiceRepository(db)
-	xpr := repository.NewXUIPanelRepository(db)
+	xpr := repository.NewXUIPanelRepository(db, jwtSecret)
 
 	// ── Services ──────────────────────────────────────────────────────────
 	authSvc   := auth.NewService(ur, wr, jwtSecret)
@@ -57,6 +59,14 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 	walletSvc := wallet.NewService(wr)
 	orderSvc  := order.NewService(db, or_, ir, jr, wt, cp, hub, psr)
 	proxySvc  := proxy.NewService(db, psr, xpr, jr, or_, hub)
+
+	// ── Provisioning worker (background)
+	go func() {
+		ctx := context.Background()
+		adapter := xui.NewAdapter(xui.NewClient("", ""))
+		w := provisioning.NewWorkerV2(db, jr, or_, cr, xpr, psr, adapter, hub)
+		w.Start(ctx)
+	}()
 
 	// ── Static assets ─────────────────────────────────────────────────────
 	mux.Handle("/assets/", stdhttp.StripPrefix("/assets/",
