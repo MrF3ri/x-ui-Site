@@ -31,7 +31,7 @@ import (
 
 type Server struct{ http *stdhttp.Server }
 
-func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint string) *Server {
+func New(addr string, db *sql.DB, jwtSecret, panelKey, appEnv, redisAddr, minioEndpoint string) *Server {
 	mux := stdhttp.NewServeMux()
 
 	// ── Infrastructure ────────────────────────────────────────────────────
@@ -51,7 +51,7 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 	wt := repository.NewWalletTxRepository(db)
 	cp := repository.NewCatalogPriceRepository(db)
 	psr := repository.NewProxyServiceRepository(db)
-	xpr := repository.NewXUIPanelRepository(db, jwtSecret)
+	xpr := repository.NewXUIPanelRepository(db, panelKey)
 
 	// ── Services ──────────────────────────────────────────────────────────
 	authSvc := auth.NewService(ur, wr, jwtSecret)

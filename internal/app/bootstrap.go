@@ -38,7 +38,7 @@ func Run() error {
 		log.Printf("seed complete")
 	}
 
-	srv := httpserver.New(cfg.AppPort, dbConn, cfg.JWTSecret, cfg.AppEnv, cfg.RedisAddr, cfg.MinIOEndpoint)
+	srv := httpserver.New(cfg.AppPort, dbConn, cfg.JWTSecret, cfg.PanelEncryptionKey, cfg.AppEnv, cfg.RedisAddr, cfg.MinIOEndpoint)
 	log.Printf("services initialized")
 	log.Printf("http listening on :%s", cfg.AppPort)
 	return srv.Start()
