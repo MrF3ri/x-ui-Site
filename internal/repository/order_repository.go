@@ -150,8 +150,8 @@ func (r *ProvisioningJobRepository) EnqueueTx(ctx context.Context, tx *sql.Tx, v
 }
 
 func (r *ProvisioningJobRepository) ClaimNext(ctx context.Context) (jobID, orderID, vendorID int64, err error) {
-		err = r.db.QueryRowContext(ctx,
-				`UPDATE provisioning_jobs SET status='provisioning', updated_at=now()
+	err = r.db.QueryRowContext(ctx,
+		`UPDATE provisioning_jobs SET status='provisioning', updated_at=now()
 				 WHERE id = (
 					 SELECT id FROM provisioning_jobs
 					 WHERE status='pending' AND dead_letter=FALSE AND deleted_at IS NULL
@@ -159,11 +159,11 @@ func (r *ProvisioningJobRepository) ClaimNext(ctx context.Context) (jobID, order
 					 FOR UPDATE SKIP LOCKED
 					 LIMIT 1
 				 ) RETURNING id, order_id, vendor_id`,
-		).Scan(&jobID, &orderID, &vendorID)
-		if err != nil {
-				return 0, 0, 0, err
-		}
-		return jobID, orderID, vendorID, nil
+	).Scan(&jobID, &orderID, &vendorID)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return jobID, orderID, vendorID, nil
 }
 
 func (r *ProvisioningJobRepository) MarkDone(ctx context.Context, jobID int64) error {
@@ -225,9 +225,9 @@ func NewCatalogPriceRepository(db *sql.DB) *CatalogPriceRepository {
 }
 
 type CatalogPrice struct {
-	VendorID int64
-	Price    int64
-	IsActive bool
+	VendorID  int64
+	Price     int64
+	IsActive  bool
 	ExpiresAt time.Time // zero if not applicable
 }
 

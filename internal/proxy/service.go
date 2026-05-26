@@ -26,12 +26,12 @@ const (
 
 // Service handles proxy service lifecycle.
 type Service struct {
-	db       *sql.DB
-	proxies  *repository.ProxyServiceRepository
-	panels   *repository.XUIPanelRepository
-	jobs     *repository.ProvisioningJobRepository
-	orders   *repository.OrderRepository
-	notifier *notification.Hub
+	db        *sql.DB
+	proxies   *repository.ProxyServiceRepository
+	panels    *repository.XUIPanelRepository
+	jobs      *repository.ProvisioningJobRepository
+	orders    *repository.OrderRepository
+	notifier  *notification.Hub
 	xuiClient *xui.Client
 }
 
@@ -44,11 +44,11 @@ func NewService(
 	notifier *notification.Hub,
 ) *Service {
 	return &Service{
-		db:      db,
-		proxies: proxies,
-		panels:  panels,
-		jobs:    jobs,
-		orders:  orders,
+		db:       db,
+		proxies:  proxies,
+		panels:   panels,
+		jobs:     jobs,
+		orders:   orders,
 		notifier: notifier,
 	}
 }

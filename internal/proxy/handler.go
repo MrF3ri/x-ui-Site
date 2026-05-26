@@ -14,10 +14,10 @@ func NewHandler(svc *Service) *Handler { return &Handler{svc: svc} }
 
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/service/provision", h.provision)
-	mux.HandleFunc("/api/v1/service/get",       h.get)
-	mux.HandleFunc("/api/v1/service/list",      h.list)
-	mux.HandleFunc("/api/v1/service/suspend",   h.suspend)
-	mux.HandleFunc("/api/v1/service/resume",    h.resume)
+	mux.HandleFunc("/api/v1/service/get", h.get)
+	mux.HandleFunc("/api/v1/service/list", h.list)
+	mux.HandleFunc("/api/v1/service/suspend", h.suspend)
+	mux.HandleFunc("/api/v1/service/resume", h.resume)
 }
 
 func (h *Handler) provision(w http.ResponseWriter, r *http.Request) {

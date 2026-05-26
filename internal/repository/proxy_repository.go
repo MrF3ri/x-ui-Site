@@ -4,27 +4,29 @@ import (
 	"context"
 	"database/sql"
 	"time"
+
+	"garudapanel/internal/security"
 )
 
 // ProxyServiceRecord represents a provisioned VPN service row.
 type ProxyServiceRecord struct {
-	ID                 int64
-	VendorID           int64
-	UserID             int64
-	OrderID            *int64
-	PanelID            *int64
-	UUID               string
-	Protocol           string
-	SubscriptionURL    string
-	QRPayload          string
-	ConfigPayload      string
-	Status             string
-	ExpiresAt          *time.Time
-	TrafficUsedGB      int
-	TrafficLimitGB     int
-	DurationDays       int
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	ID              int64
+	VendorID        int64
+	UserID          int64
+	OrderID         *int64
+	PanelID         *int64
+	UUID            string
+	Protocol        string
+	SubscriptionURL string
+	QRPayload       string
+	ConfigPayload   string
+	Status          string
+	ExpiresAt       *time.Time
+	TrafficUsedGB   int
+	TrafficLimitGB  int
+	DurationDays    int
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 type ProxyServiceRepository struct{ db *sql.DB }
@@ -256,10 +258,13 @@ func (r *ProxyServiceRepository) MarkExpired(ctx context.Context) (int64, error)
 }
 
 // XUIPanelRepository manages vendor xui panels.
-type XUIPanelRepository struct{ db *sql.DB }
+type XUIPanelRepository struct {
+	db         *sql.DB
+	passphrase string
+}
 
-func NewXUIPanelRepository(db *sql.DB) *XUIPanelRepository {
-	return &XUIPanelRepository{db: db}
+func NewXUIPanelRepository(db *sql.DB, passphrase string) *XUIPanelRepository {
+	return &XUIPanelRepository{db: db, passphrase: passphrase}
 }
 
 type XUIPanelRecord struct {
@@ -276,24 +281,38 @@ type XUIPanelRecord struct {
 
 func (r *XUIPanelRepository) Create(ctx context.Context, rec XUIPanelRecord) (int64, error) {
 	var id int64
-	err := r.db.QueryRowContext(ctx,
+	enc, err := security.Encrypt(r.passphrase, rec.Token)
+	if err != nil {
+		return 0, err
+	}
+	err = r.db.QueryRowContext(ctx,
 		`INSERT INTO xui_panels(vendor_id, name, url, token, inbound_id, is_active)
 		 VALUES($1,$2,$3,$4,$5,$6) RETURNING id`,
-		rec.VendorID, rec.Name, rec.URL, rec.Token, rec.InboundID, rec.IsActive,
+		rec.VendorID, rec.Name, rec.URL, enc, rec.InboundID, rec.IsActive,
 	).Scan(&id)
 	return id, err
 }
 
 func (r *XUIPanelRepository) FirstActive(ctx context.Context, vendorID int64) (XUIPanelRecord, error) {
 	var rec XUIPanelRecord
+	var encToken string
 	err := r.db.QueryRowContext(ctx,
 		`SELECT id, vendor_id, name, url, token, inbound_id, is_active, health
 		 FROM xui_panels
 		 WHERE vendor_id=$1 AND is_active=TRUE AND deleted_at IS NULL
 		 ORDER BY id LIMIT 1`,
 		vendorID,
-	).Scan(&rec.ID, &rec.VendorID, &rec.Name, &rec.URL, &rec.Token,
+	).Scan(&rec.ID, &rec.VendorID, &rec.Name, &rec.URL, &encToken,
 		&rec.InboundID, &rec.IsActive, &rec.Health)
+	if err != nil {
+		return rec, err
+	}
+	// decrypt token
+	tok, err := security.Decrypt(r.passphrase, encToken)
+	if err != nil {
+		return rec, err
+	}
+	rec.Token = tok
 	return rec, err
 }
 
@@ -318,10 +337,16 @@ func (r *XUIPanelRepository) ListByVendor(ctx context.Context, vendorID int64) (
 	var out []XUIPanelRecord
 	for rows.Next() {
 		var rec XUIPanelRecord
+		var encToken string
 		if err := rows.Scan(&rec.ID, &rec.VendorID, &rec.Name, &rec.URL,
-			&rec.Token, &rec.InboundID, &rec.IsActive, &rec.Health); err != nil {
+			&encToken, &rec.InboundID, &rec.IsActive, &rec.Health); err != nil {
 			return nil, err
 		}
+		tok, err := security.Decrypt(r.passphrase, encToken)
+		if err != nil {
+			return nil, err
+		}
+		rec.Token = tok
 		out = append(out, rec)
 	}
 	return out, rows.Err()

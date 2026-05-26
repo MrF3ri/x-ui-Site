@@ -6,27 +6,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	stdhttp "net/http"
 	"net"
+	stdhttp "net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"garudapanel/internal/audit"
 	"garudapanel/internal/auth"
+	"garudapanel/internal/dashboard"
 	"garudapanel/internal/eventbus"
 	api "garudapanel/internal/http/api"
 	"garudapanel/internal/middleware"
 	"garudapanel/internal/notification"
 	"garudapanel/internal/order"
+	"garudapanel/internal/provisioning"
 	"garudapanel/internal/proxy"
 	"garudapanel/internal/repository"
-	"garudapanel/internal/provisioning"
-	"garudapanel/internal/xui"
 	"garudapanel/internal/storefront"
-	"garudapanel/internal/dashboard"
 	"garudapanel/internal/vendor"
 	"garudapanel/internal/wallet"
+	"garudapanel/internal/xui"
 )
 
 type Server struct{ http *stdhttp.Server }
@@ -35,30 +35,30 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 	mux := stdhttp.NewServeMux()
 
 	// ── Infrastructure ────────────────────────────────────────────────────
-	bus      := eventbus.New()
-	hub      := notification.NewHub(bus)
-	auditor  := audit.NewLogger(db)
-	limiter  := middleware.NewRateLimiter(120, time.Minute) // 120 req/min per IP
+	bus := eventbus.New()
+	hub := notification.NewHub(bus)
+	auditor := audit.NewLogger(db)
+	limiter := middleware.NewRateLimiter(120, time.Minute) // 120 req/min per IP
 
 	// ── Repositories ──────────────────────────────────────────────────────
-	ur  := repository.NewUserRepository(db)
-	wr  := repository.NewWalletRepository(db)
-	vr  := repository.NewVendorRepository(db)
-	cr  := repository.NewCatalogRepository(db)
+	ur := repository.NewUserRepository(db)
+	wr := repository.NewWalletRepository(db)
+	vr := repository.NewVendorRepository(db)
+	cr := repository.NewCatalogRepository(db)
 	or_ := repository.NewOrderRepository(db)
-	ir  := repository.NewIdempotencyRepository(db)
-	jr  := repository.NewProvisioningJobRepository(db)
-	wt  := repository.NewWalletTxRepository(db)
-	cp  := repository.NewCatalogPriceRepository(db)
+	ir := repository.NewIdempotencyRepository(db)
+	jr := repository.NewProvisioningJobRepository(db)
+	wt := repository.NewWalletTxRepository(db)
+	cp := repository.NewCatalogPriceRepository(db)
 	psr := repository.NewProxyServiceRepository(db)
 	xpr := repository.NewXUIPanelRepository(db, jwtSecret)
 
 	// ── Services ──────────────────────────────────────────────────────────
-	authSvc   := auth.NewService(ur, wr, jwtSecret)
+	authSvc := auth.NewService(ur, wr, jwtSecret)
 	vendorSvc := vendor.NewService(vr)
 	walletSvc := wallet.NewService(wr)
-	orderSvc  := order.NewService(db, or_, ir, jr, wt, cp, hub, psr)
-	proxySvc  := proxy.NewService(db, psr, xpr, jr, or_, hub)
+	orderSvc := order.NewService(db, or_, ir, jr, wt, cp, hub, psr)
+	proxySvc := proxy.NewService(db, psr, xpr, jr, or_, hub)
 
 	// ── Provisioning worker (background)
 	go func() {
@@ -74,7 +74,7 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 
 	// ── Storefront (public, SSR wallet-aware) ─────────────────────────────
 	if sfh, err := storefront.NewHandler(db, jwtSecret, walletSvc); err == nil {
-		mux.HandleFunc("/store",  sfh.Router)
+		mux.HandleFunc("/store", sfh.Router)
 		mux.HandleFunc("/store/", sfh.Router)
 	} else {
 		log.Printf("storefront init failed: %v", err)
@@ -100,16 +100,17 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 	apiRouter.Register(mux)
 
 	// ── Order routes (JWT required) ───────────────────────────────────────
-	jwtMW   := middleware.JWT(jwtSecret)
-	userMW  := middleware.RequireRole("user", "vendor", "admin")
-	vendMW  := middleware.RequireRole("vendor", "admin")
+	jwtMW := middleware.JWT(jwtSecret)
+	userMW := middleware.RequireRole("user", "vendor", "admin")
+	vendMW := middleware.RequireRole("vendor", "admin")
 	adminMW := middleware.RequireRole("admin")
 
 	// POST /api/v1/order/create
 	mux.HandleFunc("/api/v1/order/create", middleware.Chain(
 		func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 			if r.Method != stdhttp.MethodPost {
-				httpError(w, 405, "method not allowed"); return
+				httpError(w, 405, "method not allowed")
+				return
 			}
 			var body struct {
 				VendorID       int64  `json:"vendor_id"`
@@ -117,7 +118,8 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 				IdempotencyKey string `json:"idempotency_key"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				httpError(w, 400, "bad request"); return
+				httpError(w, 400, "bad request")
+				return
 			}
 			userID := middleware.UserIDFromCtx(r.Context())
 			resp, err := orderSvc.Create(r.Context(), order.CreateRequest{
@@ -128,11 +130,14 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 			})
 			if err != nil {
 				auditor.Log(r.Context(), audit.FromRequest(r, "order.create", "order", "error"))
-				httpError(w, 400, err.Error()); return
+				httpError(w, 400, err.Error())
+				return
 			}
 			auditor.Log(r.Context(), audit.FromRequest(r, "order.create", "order", "ok"))
 			code := 201
-			if resp.Duplicate { code = 200 }
+			if resp.Duplicate {
+				code = 200
+			}
 			writeJSON(w, code, resp)
 		},
 		jwtMW, userMW,
@@ -141,13 +146,23 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 	// POST /api/v1/order/renew/:serviceID
 	mux.HandleFunc("/api/v1/order/renew/", middleware.Chain(
 		func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
-			if r.Method != stdhttp.MethodPost { httpError(w, 405, "method not allowed"); return }
+			if r.Method != stdhttp.MethodPost {
+				httpError(w, 405, "method not allowed")
+				return
+			}
 			sidStr := strings.TrimPrefix(r.URL.Path, "/api/v1/order/renew/")
 			sid, _ := strconv.ParseInt(sidStr, 10, 64)
-			if sid == 0 { httpError(w, 400, "invalid service id"); return }
+			if sid == 0 {
+				httpError(w, 400, "invalid service id")
+				return
+			}
 			userID := middleware.UserIDFromCtx(r.Context())
 			resp, err := orderSvc.Renew(r.Context(), userID, sid)
-			if err != nil { auditor.Log(r.Context(), audit.FromRequest(r, "order.renew", "order", "error")); httpError(w, 400, err.Error()); return }
+			if err != nil {
+				auditor.Log(r.Context(), audit.FromRequest(r, "order.renew", "order", "error"))
+				httpError(w, 400, err.Error())
+				return
+			}
 			auditor.Log(r.Context(), audit.FromRequest(r, "order.renew", "order", "ok"))
 			writeJSON(w, 201, resp)
 		},
@@ -158,13 +173,17 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 	mux.HandleFunc("/api/v1/order/get", middleware.Chain(
 		func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 			vendorID, _ := strconv.ParseInt(r.URL.Query().Get("vendor_id"), 10, 64)
-			orderID,  _ := strconv.ParseInt(r.URL.Query().Get("order_id"),  10, 64)
+			orderID, _ := strconv.ParseInt(r.URL.Query().Get("order_id"), 10, 64)
 			o, err := or_.ByID(r.Context(), vendorID, orderID)
-			if err != nil { httpError(w, 404, "not found"); return }
+			if err != nil {
+				httpError(w, 404, "not found")
+				return
+			}
 			// Enforce: users can only see their own orders
 			if middleware.RoleFromCtx(r.Context()) == "user" &&
 				o.UserID != middleware.UserIDFromCtx(r.Context()) {
-				httpError(w, 403, "forbidden"); return
+				httpError(w, 403, "forbidden")
+				return
 			}
 			writeJSON(w, 200, o)
 		},
@@ -176,15 +195,18 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 	proxyHandler.Register(mux)
 
 	// ── User dashboard (JWT required) ───────────────────────────────────
-    if dh := dashboard.NewHandler(db, or_, psr, wr, walletSvc); dh != nil {
-        mux.HandleFunc("/dashboard", middleware.Chain(dh.Router, jwtMW, userMW))
-        mux.HandleFunc("/dashboard/", middleware.Chain(dh.Router, jwtMW, userMW))
-    }
+	if dh := dashboard.NewHandler(db, or_, psr, wr, walletSvc); dh != nil {
+		mux.HandleFunc("/dashboard", middleware.Chain(dh.Router, jwtMW, userMW))
+		mux.HandleFunc("/dashboard/", middleware.Chain(dh.Router, jwtMW, userMW))
+	}
 
 	// ── Vendor: catalog management ────────────────────────────────────────
 	mux.HandleFunc("/api/v1/vendor/catalog/create", middleware.Chain(
 		func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
-			if r.Method != stdhttp.MethodPost { httpError(w, 405, "method not allowed"); return }
+			if r.Method != stdhttp.MethodPost {
+				httpError(w, 405, "method not allowed")
+				return
+			}
 			var p struct {
 				VendorID       int64  `json:"vendor_id"`
 				Slug           string `json:"slug"`
@@ -203,7 +225,8 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 				StockStatus    string `json:"stock_status"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-				httpError(w, 400, "bad request"); return
+				httpError(w, 400, "bad request")
+				return
 			}
 			if err := cr.Create(repository.CatalogItemInput{
 				VendorID: p.VendorID, Slug: p.Slug, Title: p.Title,
@@ -214,7 +237,8 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 				AutoProvision: p.AutoProvision, RenewalEnabled: p.RenewalEnabled,
 				CountryCode: p.CountryCode, StockStatus: p.StockStatus,
 			}); err != nil {
-				httpError(w, 400, err.Error()); return
+				httpError(w, 400, err.Error())
+				return
 			}
 			auditor.Log(r.Context(), audit.FromRequest(r, "catalog.create", "catalog_item", "ok"))
 			writeJSON(w, 201, map[string]string{"status": "created"})
@@ -230,7 +254,10 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 				        traffic_limit_gb,duration_days,price_toman,is_active,auto_provision,
 				        renewal_enabled,country_code,stock_status
 				 FROM catalog_items WHERE vendor_id=$1 AND deleted_at IS NULL`, vid)
-			if err != nil { httpError(w, 400, err.Error()); return }
+			if err != nil {
+				httpError(w, 400, err.Error())
+				return
+			}
 			defer rows.Close()
 			out := []map[string]any{}
 			for rows.Next() {
@@ -258,7 +285,10 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 	// ── Panel management ──────────────────────────────────────────────────
 	mux.HandleFunc("/api/v1/vendor/panel/add", middleware.Chain(
 		func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
-			if r.Method != stdhttp.MethodPost { httpError(w, 405, "method not allowed"); return }
+			if r.Method != stdhttp.MethodPost {
+				httpError(w, 405, "method not allowed")
+				return
+			}
 			var body struct {
 				VendorID  int64  `json:"vendor_id"`
 				Name      string `json:"name"`
@@ -267,7 +297,8 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 				InboundID int64  `json:"inbound_id"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				httpError(w, 400, "bad request"); return
+				httpError(w, 400, "bad request")
+				return
 			}
 			id, err := xpr.Create(r.Context(), repository.XUIPanelRecord{
 				VendorID:  body.VendorID,
@@ -277,7 +308,10 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 				InboundID: body.InboundID,
 				IsActive:  true,
 			})
-			if err != nil { httpError(w, 400, err.Error()); return }
+			if err != nil {
+				httpError(w, 400, err.Error())
+				return
+			}
 			auditor.Log(r.Context(), audit.FromRequest(r, "panel.add", "xui_panel", "ok"))
 			writeJSON(w, 201, map[string]any{"panel_id": id, "status": "created"})
 		},
@@ -288,7 +322,10 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 		func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 			vid, _ := strconv.ParseInt(r.URL.Query().Get("vendor_id"), 10, 64)
 			panels, err := xpr.ListByVendor(r.Context(), vid)
-			if err != nil { httpError(w, 400, err.Error()); return }
+			if err != nil {
+				httpError(w, 400, err.Error())
+				return
+			}
 			writeJSON(w, 200, panels)
 		},
 		jwtMW, vendMW,
@@ -297,16 +334,21 @@ func New(addr string, db *sql.DB, jwtSecret, appEnv, redisAddr, minioEndpoint st
 	// ── Wallet top-up (admin only) ────────────────────────────────────────
 	mux.HandleFunc("/api/v1/admin/wallet/topup", middleware.Chain(
 		func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
-			if r.Method != stdhttp.MethodPost { httpError(w, 405, "method not allowed"); return }
+			if r.Method != stdhttp.MethodPost {
+				httpError(w, 405, "method not allowed")
+				return
+			}
 			var body struct {
 				UserID int64 `json:"user_id"`
 				Amount int64 `json:"amount"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				httpError(w, 400, "bad request"); return
+				httpError(w, 400, "bad request")
+				return
 			}
 			if err := wr.ApplyTransaction(body.UserID, body.Amount, "admin_topup"); err != nil {
-				httpError(w, 400, err.Error()); return
+				httpError(w, 400, err.Error())
+				return
 			}
 			auditor.Log(r.Context(), audit.FromRequest(r, "wallet.topup", "wallet", "ok"))
 			writeJSON(w, 200, map[string]string{"status": "ok"})
@@ -355,9 +397,13 @@ func httpError(w stdhttp.ResponseWriter, code int, msg string) {
 }
 
 func probeTCP(addr string) string {
-	if addr == "" { return "down" }
+	if addr == "" {
+		return "down"
+	}
 	c, err := net.DialTimeout("tcp", addr, 800*time.Millisecond)
-	if err != nil { return "down" }
+	if err != nil {
+		return "down"
+	}
 	_ = c.Close()
 	return "up"
 }

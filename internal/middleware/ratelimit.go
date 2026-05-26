@@ -13,10 +13,10 @@ type bucket struct {
 
 // RateLimiter is a simple in-memory per-IP sliding window rate limiter.
 type RateLimiter struct {
-	mu       sync.Mutex
-	buckets  map[string]*bucket
-	limit    int
-	window   time.Duration
+	mu      sync.Mutex
+	buckets map[string]*bucket
+	limit   int
+	window  time.Duration
 }
 
 // NewRateLimiter creates a limiter: limit requests per window duration.

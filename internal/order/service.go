@@ -15,13 +15,13 @@ import (
 
 // LifecycleState constants.
 const (
-	StateApproved    = "approved"
-	StatePending     = "pending"
+	StateApproved     = "approved"
+	StatePending      = "pending"
 	StateProvisioning = "provisioning"
-	StateActive      = "active"
-	StateSuspended   = "suspended"
-	StateExpired     = "expired"
-	StateFailed      = "failed"
+	StateActive       = "active"
+	StateSuspended    = "suspended"
+	StateExpired      = "expired"
+	StateFailed       = "failed"
 )
 
 // Service orchestrates order creation with idempotency and transactional wallet deduction.
@@ -170,6 +170,7 @@ type CreateResponse struct {
 //  7. Inserts idempotency key row.
 //  8. Enqueues provisioning job.
 //  9. Commits.
+//
 // 10. Emits notification event.
 func (s *Service) Create(ctx context.Context, req CreateRequest) (CreateResponse, error) {
 	if req.IdempotencyKey == "" {
